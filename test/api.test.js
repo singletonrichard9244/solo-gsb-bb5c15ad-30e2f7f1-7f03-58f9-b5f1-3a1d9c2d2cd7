@@ -3,8 +3,12 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { openDatabase } = require('../src/db');
-const { buildApp } = require('../src/app');
-const { commitmentForVersion, computeOrder } = require('../src/lottery');
+const { buildApp, validateGroups } = require('../src/app');
+const {
+  sha256Hex,
+  commitmentForVersion,
+  computeGroupedResult,
+} = require('../src/lottery');
 
 function makeApp() {
   const db = openDatabase(':memory:');
@@ -12,17 +16,21 @@ function makeApp() {
   return { db, app };
 }
 
-const CANDIDATES = ['alice', 'bob', 'carol', 'dave', 'erin'];
+const GROUPS = [
+  { name: 'red', quota: 2, candidates: ['alice', 'bob', 'carol'] },
+  { name: 'blue', quota: 1, candidates: ['dave', 'erin'] },
+];
+const groupsOnly = () => GROUPS.map((g) => ({ name: g.name, quota: g.quota, candidates: [...g.candidates] }));
+
+async function createDraw(app, groups = groupsOnly()) {
+  const res = await app.inject({ method: 'POST', url: '/draws', payload: { groups } });
+  assert.equal(res.statusCode, 201, res.body);
+  return res.json();
+}
 
 test('create returns only the commitment, never the seed', async () => {
   const { app } = makeApp();
-  const res = await app.inject({
-    method: 'POST',
-    url: '/draws',
-    payload: { candidates: CANDIDATES, count: 2 },
-  });
-  assert.equal(res.statusCode, 201);
-  const body = res.json();
+  const body = await createDraw(app);
   assert.match(body.commitment, /^[0-9a-f]{64}$/);
   assert.equal(body.seed, undefined);
   assert.equal(body.status, 'pending');
@@ -33,11 +41,7 @@ test('create returns only the commitment, never the seed', async () => {
 
 test('reveal is single-shot and reproducible', async () => {
   const { app } = makeApp();
-  const created = (await app.inject({
-    method: 'POST',
-    url: '/draws',
-    payload: { candidates: CANDIDATES, count: 2 },
-  })).json();
+  const created = await createDraw(app);
 
   const reveal = await app.inject({
     method: 'POST',
@@ -46,9 +50,20 @@ test('reveal is single-shot and reproducible', async () => {
   });
   assert.equal(reveal.statusCode, 200);
   const r = reveal.json();
-  assert.equal(commitmentForVersion(r.version, r.seed, r.snapshotDigest), created.commitment);
-  assert.deepEqual(r.order, computeOrder(r.seed, r.nonce, CANDIDATES));
-  assert.deepEqual(r.winners, r.order.slice(0, 2));
+  assert.equal(
+    commitmentForVersion(r.version, r.seed, r.snapshotDigest),
+    created.commitment
+  );
+  const expected = computeGroupedResult(r.seed, 'nonce-1', GROUPS);
+  assert.equal(r.results.length, expected.length);
+  r.results.forEach((g, i) => {
+    assert.equal(g.name, expected[i].name);
+    assert.equal(g.quota, expected[i].quota);
+    assert.deepEqual(g.order, expected[i].order);
+    assert.deepEqual(g.winners, expected[i].winners);
+    assert.deepEqual(g.candidates, GROUPS[i].candidates, 'group membership is echoed');
+  });
+  assert.deepEqual(r.results.map((g) => g.winners.length), [2, 1]);
 
   const again = await app.inject({
     method: 'POST',
@@ -58,13 +73,9 @@ test('reveal is single-shot and reproducible', async () => {
   assert.equal(again.statusCode, 409, 'second nonce submission must be rejected');
 });
 
-test('independent verify accepts honest records and flags tampering', async () => {
+test('independent verify accepts honest v3 records and flags a forged seed/nonce/result', async () => {
   const { app } = makeApp();
-  const created = (await app.inject({
-    method: 'POST',
-    url: '/draws',
-    payload: { candidates: CANDIDATES, count: 2 },
-  })).json();
+  const created = await createDraw(app);
   const revealed = (await app.inject({
     method: 'POST',
     url: `/draws/${created.drawId}/reveal`,
@@ -72,47 +83,42 @@ test('independent verify accepts honest records and flags tampering', async () =
   })).json();
 
   const record = {
-    version: revealed.version,
+    version: 'v3',
     snapshotDigest: revealed.snapshotDigest,
     commitment: revealed.commitment,
     seed: revealed.seed,
-    nonce: revealed.nonce,
-    candidates: revealed.candidates,
-    count: revealed.count,
-    order: revealed.order,
-    winners: revealed.winners,
+    nonce: 'nonce-1',
+    groups: groupsOnly(),
+    results: revealed.results,
   };
-  const ok = await app.inject({ method: 'POST', url: '/verify', payload: record });
-  assert.equal(ok.json().valid, true);
+  assert.equal((await app.inject({ method: 'POST', url: '/verify', payload: record })).json().valid, true);
 
   const badSeed = await app.inject({
-    method: 'POST',
-    url: '/verify',
-    payload: { ...record, seed: '0'.repeat(64) },
+    method: 'POST', url: '/verify', payload: { ...record, seed: '0'.repeat(64) },
   });
   assert.equal(badSeed.json().valid, false);
   assert.ok(badSeed.json().problems.some((p) => p.includes('commitment')));
 
-  const badOrder = { ...record, order: record.order.slice().reverse() };
-  const tampered = await app.inject({ method: 'POST', url: '/verify', payload: badOrder });
-  assert.equal(tampered.json().valid, false);
-  assert.ok(tampered.json().problems.some((p) => p.includes('order')));
-
+  // A forged nonce does not move the commitment (it only feeds the shuffle),
+  // so supplying it alongside the honest results exposes an order mismatch.
   const badNonce = await app.inject({
-    method: 'POST',
-    url: '/verify',
-    payload: { ...record, nonce: 'forged' },
+    method: 'POST', url: '/verify', payload: { ...record, nonce: 'forged' },
   });
-  assert.equal(badNonce.json().valid, false);
+  const badNonceBody = badNonce.json();
+  assert.equal(badNonceBody.valid, false);
+  assert.equal(badNonceBody.checks.ordersMatch, false);
+  assert.ok(badNonceBody.problems.some((p) => p.includes('order mismatch')));
+
+  const badOrder = {
+    ...record,
+    results: record.results.map((g) => (g.name === 'red' ? { ...g, order: [...g.order].reverse(), winners: [...g.order].reverse().slice(0, g.quota) } : g)),
+  };
+  assert.equal((await app.inject({ method: 'POST', url: '/verify', payload: badOrder })).json().valid, false);
 });
 
-test('stored verify endpoint recomputes from the snapshot', async () => {
+test('stored verify endpoint recomputes grouped results from the snapshot', async () => {
   const { app } = makeApp();
-  const created = (await app.inject({
-    method: 'POST',
-    url: '/draws',
-    payload: { candidates: CANDIDATES, count: 3 },
-  })).json();
+  const created = await createDraw(app);
 
   const early = await app.inject({ method: 'GET', url: `/draws/${created.drawId}/verify` });
   assert.equal(early.statusCode, 409, 'cannot verify a pending draw');
@@ -129,19 +135,29 @@ test('stored verify endpoint recomputes from the snapshot', async () => {
 test('input validation', async () => {
   const { app } = makeApp();
 
-  const dupes = await app.inject({
-    method: 'POST',
-    url: '/draws',
-    payload: { candidates: ['a', 'a'], count: 1 },
-  });
-  assert.equal(dupes.statusCode, 400, 'duplicate candidates rejected');
+  // duplicate group name
+  assert.equal((await app.inject({
+    method: 'POST', url: '/draws',
+    payload: { groups: [{ name: 'a', candidates: ['x'], quota: 1 }, { name: 'a', candidates: ['y'], quota: 1 }] },
+  })).statusCode, 400);
 
-  const tooMany = await app.inject({
-    method: 'POST',
-    url: '/draws',
-    payload: { candidates: ['a', 'b'], count: 3 },
-  });
-  assert.equal(tooMany.statusCode, 400, 'count > candidates rejected');
+  // quota larger than the group
+  assert.equal((await app.inject({
+    method: 'POST', url: '/draws',
+    payload: { groups: [{ name: 'a', candidates: ['x', 'y'], quota: 3 }] },
+  })).statusCode, 400);
+
+  // globally duplicate candidate
+  assert.equal((await app.inject({
+    method: 'POST', url: '/draws',
+    payload: { groups: [{ name: 'a', candidates: ['x'], quota: 1 }, { name: 'b', candidates: ['x'], quota: 1 }] },
+  })).statusCode, 400);
+
+  // total quota zero
+  assert.equal((await app.inject({
+    method: 'POST', url: '/draws',
+    payload: { groups: [{ name: 'a', candidates: ['x'], quota: 0 }] },
+  })).statusCode, 400);
 
   const emptyNonce = await app.inject({
     method: 'POST',
@@ -154,15 +170,37 @@ test('input validation', async () => {
   assert.equal(missing.statusCode, 404);
 });
 
-test('shuffle is unbiased (rejection sampling sanity)', () => {
+test('validateGroups covers every creation invariant', () => {
+  assert.equal(validateGroups([{ name: 'a', candidates: ['x'], quota: 0 }, { name: 'b', candidates: ['y'], quota: 1 }]), null);
+  assert.equal(validateGroups([{ name: 'a', candidates: ['x'], quota: 1 }]), null);
+  assert.ok(validateGroups([]));
+  assert.ok(validateGroups([{ name: 'a', candidates: [], quota: 0 }]));
+  assert.ok(validateGroups([{ name: 'a', candidates: ['x'], quota: -1 }]));
+  assert.ok(validateGroups([{ name: 'a', candidates: ['x', 'x'], quota: 1 }]));
+  assert.ok(validateGroups([{ name: 'a', candidates: ['x'] }, { name: 'a', candidates: ['y'], quota: 1 }]));
+  assert.ok(validateGroups([{ name: 'a', candidates: ['x'], quota: 1 }, { name: 'b', candidates: ['x'], quota: 1 }]));
+  assert.ok(validateGroups([{ name: 'a', candidates: ['x'], quota: 0 }]));
+});
+
+test('per-group shuffle is unbiased (rejection sampling sanity)', () => {
+  const { computeGroupOrder } = require('../src/lottery');
   const trials = 120000;
   const first = new Map();
   for (let k = 0; k < trials; k += 1) {
-    const order = computeOrder('f'.repeat(64), `n-${k}`, ['x', 'y', 'z']);
+    const order = computeGroupOrder('f'.repeat(64), `n-${k}`, 0, ['x', 'y', 'z']);
     first.set(order[0], (first.get(order[0]) || 0) + 1);
   }
   for (const name of ['x', 'y', 'z']) {
     const p = first.get(name) / trials;
     assert.ok(Math.abs(p - 1 / 3) < 0.01, `${name} first-place probability ${p} within 1% of 1/3`);
   }
+});
+
+test('commitment formula for a revealed draw matches sha256(v3:seed:digest)', async () => {
+  const { app } = makeApp();
+  const created = await createDraw(app);
+  const r = (await app.inject({
+    method: 'POST', url: `/draws/${created.drawId}/reveal`, payload: { nonce: 'n' },
+  })).json();
+  assert.equal(r.commitment, sha256Hex(`v3:${r.seed}:${created.snapshotDigest}`));
 });

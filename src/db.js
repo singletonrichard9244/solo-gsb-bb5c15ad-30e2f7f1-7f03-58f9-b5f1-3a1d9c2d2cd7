@@ -18,7 +18,8 @@ const DRAWS_TABLE = `
     created_at       TEXT NOT NULL,
     revealed_at      TEXT,
     protocol_version TEXT,
-    snapshot_digest  TEXT
+    snapshot_digest  TEXT,
+    groups           TEXT
   );
 `;
 
@@ -78,6 +79,17 @@ function migrateV1ToV2(db) {
   }
 }
 
+// v3 draws replace the flat candidates/count snapshot with ordered quota
+// groups. The groups JSON (ordered [{name, candidates, quota}]) lives in the
+// new column; it stays NULL for pre-v3 rows, which remain on their original
+// (v1/v2) verification paths.
+function migrateV2ToV3(db) {
+  const columns = db.prepare('PRAGMA table_info(draws)').all().map((c) => c.name);
+  if (!columns.includes('groups')) {
+    db.exec('ALTER TABLE draws ADD COLUMN groups TEXT');
+  }
+}
+
 // Opens (creating if needed) the SQLite database and ensures the schema exists.
 function openDatabase(dbPath) {
   if (dbPath !== ':memory:') {
@@ -99,6 +111,10 @@ function openDatabase(dbPath) {
   if (version < 2) {
     migrateV1ToV2(db);
     db.exec('PRAGMA user_version = 2;');
+  }
+  if (version < 3) {
+    migrateV2ToV3(db);
+    db.exec('PRAGMA user_version = 3;');
   }
   db.exec(PARTICIPANTS_TABLE);
   db.exec(PARTICIPANTS_INDEX);

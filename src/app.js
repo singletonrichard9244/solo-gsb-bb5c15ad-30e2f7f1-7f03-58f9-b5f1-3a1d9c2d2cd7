@@ -5,11 +5,14 @@ const {
   generateSeed,
   commitmentForVersion,
   snapshotDigestFor,
+  snapshotDigestForGroups,
   secretHash,
   aggregateNonce,
   computeOrder,
+  computeGroupedResult,
   PROTOCOL_V1,
   PROTOCOL_V2,
+  PROTOCOL_V3,
   LATEST_PROTOCOL_VERSION,
 } = require('./lottery');
 
@@ -19,6 +22,8 @@ const MAX_NONCE_LENGTH = 256;
 const MAX_PARTICIPANTS = 100;
 const MAX_PARTICIPANT_NAME_LENGTH = 128;
 const MAX_SECRET_LENGTH = 1024;
+const MAX_GROUPS = 100;
+const MAX_GROUP_NAME_LENGTH = 128;
 
 const candidateListSchema = {
   type: 'array',
@@ -41,6 +46,99 @@ const secretSchema = {
   minLength: 1,
   maxLength: MAX_SECRET_LENGTH,
 };
+
+// Ordered quota groups, as supplied at creation:
+//   groups: [{ name: <unique>, candidates: <non-empty, globally unique>, quota: <0..n> }]
+const groupSchema = {
+  type: 'array',
+  minItems: 1,
+  maxItems: MAX_GROUPS,
+  items: {
+    type: 'object',
+    required: ['name', 'candidates', 'quota'],
+    additionalProperties: false,
+    properties: {
+      name: { type: 'string', minLength: 1, maxLength: MAX_GROUP_NAME_LENGTH },
+      candidates: {
+        type: 'array',
+        minItems: 1,
+        maxItems: MAX_CANDIDATES,
+        items: { type: 'string', minLength: 1, maxLength: MAX_CANDIDATE_LENGTH },
+      },
+      quota: { type: 'integer', minimum: 0 },
+    },
+  },
+};
+
+// Structural checks that JSON Schema cannot express (cross-field/global):
+// unique group names, quota within each group's size, candidates globally
+// unique and non-empty, and at least one quota in total. Returns an error
+// message, or null when the groups are valid.
+function validateGroups(groups) {
+  if (!Array.isArray(groups) || groups.length === 0) {
+    return 'groups must be a non-empty array';
+  }
+  const groupNames = new Set();
+  const globalCandidates = new Set();
+  let totalQuota = 0;
+  let totalCandidates = 0;
+
+  for (let i = 0; i < groups.length; i += 1) {
+    const group = groups[i];
+    const label = `groups[${i}]`;
+    // Tolerate non-object entries (they reach here via the lenient verify
+    // schema) and report them instead of throwing.
+    if (group === null || typeof group !== 'object' || Array.isArray(group)) {
+      return `${label} must be an object with name/candidates/quota`;
+    }
+    if (typeof group.name !== 'string' || group.name.length === 0) {
+      return `${label}.name must be a non-empty string`;
+    }
+    if (groupNames.has(group.name)) {
+      return `duplicate group name '${group.name}': 组名必须唯一`;
+    }
+    groupNames.add(group.name);
+
+    if (!Array.isArray(group.candidates) || group.candidates.length === 0) {
+      return `${label} ('${group.name}') candidates must be a non-empty array: 候选列表不能为空`;
+    }
+    if (!Number.isInteger(group.quota) || group.quota < 0) {
+      return `${label} ('${group.name}') quota must be a non-negative integer`;
+    }
+    if (group.quota > group.candidates.length) {
+      return `${label} ('${group.name}') quota ${group.quota} 不能超过该组候选人数 ${group.candidates.length}`;
+    }
+
+    const inside = new Set();
+    for (const candidate of group.candidates) {
+      if (typeof candidate !== 'string' || candidate.length === 0) {
+        return `${label} ('${group.name}') candidates must all be non-empty strings`;
+      }
+      if (inside.has(candidate)) {
+        return `${label} ('${group.name}') has duplicate candidate '${candidate}'`;
+      }
+      inside.add(candidate);
+      if (globalCandidates.has(candidate)) {
+        return `candidate '${candidate}' appears in more than one group: 候选必须全局不重复`;
+      }
+      globalCandidates.add(candidate);
+    }
+    totalQuota += group.quota;
+    totalCandidates += group.candidates.length;
+  }
+
+  if (totalCandidates > MAX_CANDIDATES) {
+    return `total candidate count must not exceed ${MAX_CANDIDATES}`;
+  }
+  if (totalQuota < 1) {
+    return 'total quota must be at least 1: 总名额至少为 1';
+  }
+  return null;
+}
+
+// Raised by verification when the request body is missing fields the selected
+// protocol requires; mapped to HTTP 400 by the route.
+class VerifyBadRequest extends Error {}
 
 function badRequest(reply, message) {
   return reply.code(400).send({
@@ -92,12 +190,94 @@ function participantViews(rows, { revealSecrets = false } = {}) {
     });
 }
 
+// Multi-party entropy-trail fields shared by status and reveal responses.
+// Before the reveal secrets stay hidden; afterwards they are public.
+function multipartyViews(row, participantRows) {
+  const revealed = row.status === 'revealed';
+  const list = participantViews(participantRows, { revealSecrets: revealed });
+  return {
+    participants: list,
+    participantCount: list.length,
+    committedCount: list.filter((p) => p.status !== 'pending').length,
+    revealedCount: list.filter((p) => p.status === 'revealed').length,
+    ...(revealed ? {
+      // Fixed participant order + per-party secret hashes: anyone can rebuild
+      // the nonce as concat(sha256(secret_i)) and independently re-run verify.
+      contributions: list.map((p) => ({
+        name: p.name,
+        position: p.position,
+        commitment: p.commitment,
+        secret: p.secret,
+        secretHash: p.secretHash,
+        committedAt: p.committedAt,
+        revealedAt: p.revealedAt,
+      })),
+    } : {}),
+  };
+}
+
+// v3 public view of one declared group. Before the reveal only the setup is
+// shown (name, quota, candidates); afterwards the shuffled order and winners
+// join in, aligned with the stored result by group position.
+function groupViews(groups, resultGroup) {
+  const view = {
+    name: groups.name,
+    quota: groups.quota,
+    candidates: groups.candidates,
+    candidateCount: groups.candidates.length,
+  };
+  if (resultGroup) {
+    view.order = resultGroup.order;
+    view.winners = resultGroup.winners;
+  }
+  return view;
+}
+
 function publicView(row, participantRows) {
+  const version = row.protocol_version || PROTOCOL_V1;
+
+  // v3: grouped quota draw.
+  if (version === PROTOCOL_V3) {
+    const groups = JSON.parse(row.groups);
+    const view = {
+      drawId: row.id,
+      mode: row.mode,
+      status: row.status,
+      version,
+      commitment: row.commitment,
+      snapshotDigest: row.snapshot_digest,
+      groups: groups.map((g) => ({
+        name: g.name,
+        quota: g.quota,
+        candidates: g.candidates,
+        candidateCount: g.candidates.length,
+      })),
+      groupCount: groups.length,
+      totalQuota: groups.reduce((sum, g) => sum + g.quota, 0),
+      candidateCount: groups.reduce((sum, g) => sum + g.candidates.length, 0),
+      createdAt: row.created_at,
+    };
+
+    if (row.mode === 'multiparty') {
+      Object.assign(view, multipartyViews(row, participantRows));
+    }
+
+    if (row.status === 'revealed') {
+      const result = JSON.parse(row.result);
+      view.seed = row.seed;
+      view.nonce = row.nonce;
+      view.results = groups.map((g, i) => groupViews(g, result.results[i]));
+      view.revealedAt = row.revealed_at;
+    }
+    return view;
+  }
+
+  // v1/v2: flat candidates/count draw (legacy records stay exactly as before).
   const view = {
     drawId: row.id,
     mode: row.mode,
     status: row.status,
-    version: row.protocol_version || PROTOCOL_V1,
+    version,
     commitment: row.commitment,
     snapshotDigest: row.snapshot_digest,
     candidates: JSON.parse(row.candidates),
@@ -106,12 +286,7 @@ function publicView(row, participantRows) {
   };
 
   if (row.mode === 'multiparty') {
-    const revealed = row.status === 'revealed';
-    const list = participantViews(participantRows, { revealSecrets: revealed });
-    view.participants = list;
-    view.participantCount = list.length;
-    view.committedCount = list.filter((p) => p.status !== 'pending').length;
-    view.revealedCount = list.filter((p) => p.status === 'revealed').length;
+    Object.assign(view, multipartyViews(row, participantRows));
   }
 
   if (row.status === 'revealed') {
@@ -121,19 +296,6 @@ function publicView(row, participantRows) {
     view.order = result.order;
     view.winners = result.winners;
     view.revealedAt = row.revealed_at;
-    if (row.mode === 'multiparty') {
-      // Fixed participant order + per-party secret hashes: anyone can rebuild
-      // the nonce as concat(sha256(secret_i)) and independently re-run verify.
-      view.contributions = view.participants.map((p) => ({
-        name: p.name,
-        position: p.position,
-        commitment: p.commitment,
-        secret: p.secret,
-        secretHash: p.secretHash,
-        committedAt: p.committedAt,
-        revealedAt: p.revealedAt,
-      }));
-    }
   }
   return view;
 }
@@ -143,8 +305,8 @@ function buildApp(db, opts = {}) {
 
   const insertDraw = db.prepare(
     `INSERT INTO draws (id, mode, status, commitment, seed, candidates, draw_count, created_at,
-                        protocol_version, snapshot_digest)
-     VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)`
+                        protocol_version, snapshot_digest, groups)
+     VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)`
   );
   const insertParticipant = db.prepare(
     `INSERT INTO participants (draw_id, position, name) VALUES (?, ?, ?)`
@@ -180,7 +342,7 @@ function buildApp(db, opts = {}) {
 
   app.get('/', async () => ({
     name: 'verifiable-draw',
-    description: 'Commit-reveal public draw with snapshot-bound v2 commitments and SHA-256 rejection-sampling Fisher-Yates',
+    description: 'Commit-reveal public draw: v3 grouped-quota snapshot commitments, SHA-256 rejection-sampling Fisher-Yates per group; v1/v2 records remain verifiable',
     endpoints: {
       create: 'POST /draws',
       reveal: 'POST /draws/:id/reveal',
@@ -195,42 +357,50 @@ function buildApp(db, opts = {}) {
   app.get('/health', async () => ({ status: 'ok' }));
 
   // ---- Create draw ------------------------------------------------------
-  // Without `participants`: legacy single-nonce flow (mode=single).
-  // With `participants`: multi-party commit-reveal entropy aggregation
-  // (mode=multiparty); the participant order is fixed at creation.
+  // v3: an ordered `groups` list ([{name, candidates, quota}]) replaces the
+  // flat candidates/count. Without `participants`: single-nonce flow
+  // (mode=single). With `participants`: multi-party commit-reveal entropy
+  // aggregation (mode=multiparty); the participant order is fixed at creation.
   app.post('/draws', {
     schema: {
       body: {
         type: 'object',
-        required: ['candidates', 'count'],
+        required: ['groups'],
         additionalProperties: false,
         properties: {
-          candidates: candidateListSchema,
-          count: { type: 'integer', minimum: 1 },
+          groups: groupSchema,
           participants: participantListSchema,
         },
       },
     },
   }, async (request, reply) => {
-    const { candidates, count, participants } = request.body;
-    if (count > candidates.length) {
-      return badRequest(reply, 'count must not exceed the number of candidates');
+    const { groups, participants } = request.body;
+
+    // Cross-field/global validation (unique names, quota within group size,
+    // globally unique non-empty candidates, total quota >= 1).
+    const groupError = validateGroups(groups);
+    if (groupError) {
+      return badRequest(reply, groupError);
     }
 
     const id = crypto.randomUUID();
     const seed = generateSeed();
-    // v2: the commitment also binds the exact candidate snapshot, so the
-    // published commitment is SHA-256("v2:<seed>:<snapshotDigest>").
-    const snapshotDigest = snapshotDigestFor(candidates, count);
+    // v3: the commitment binds the exact grouped snapshot, so the published
+    // commitment is SHA-256("v3:<seed>:<snapshotDigest>").
+    const snapshotDigest = snapshotDigestForGroups(groups);
     const commitment = commitmentForVersion(LATEST_PROTOCOL_VERSION, seed, snapshotDigest);
     const createdAt = new Date().toISOString();
     const mode = Array.isArray(participants) ? 'multiparty' : 'single';
+    const totalQuota = groups.reduce((sum, g) => sum + g.quota, 0);
+    const totalCandidates = groups.reduce((sum, g) => sum + g.candidates.length, 0);
 
+    // Legacy columns are NOT NULL; v3 rows leave them empty/zero and carry
+    // the authoritative setup in `groups`.
     db.exec('BEGIN IMMEDIATE');
     try {
       insertDraw.run(
-        id, mode, commitment, seed, JSON.stringify(candidates), count, createdAt,
-        LATEST_PROTOCOL_VERSION, snapshotDigest
+        id, mode, commitment, seed, JSON.stringify([]), 0, createdAt,
+        LATEST_PROTOCOL_VERSION, snapshotDigest, JSON.stringify(groups)
       );
       if (mode === 'multiparty') {
         participants.forEach((name, position) => insertParticipant.run(id, position, name));
@@ -250,8 +420,15 @@ function buildApp(db, opts = {}) {
       version: LATEST_PROTOCOL_VERSION,
       commitment,
       snapshotDigest,
-      count,
-      candidateCount: candidates.length,
+      groups: groups.map((g) => ({
+        name: g.name,
+        quota: g.quota,
+        candidates: g.candidates,
+        candidateCount: g.candidates.length,
+      })),
+      groupCount: groups.length,
+      totalQuota,
+      candidateCount: totalCandidates,
       createdAt,
     };
     if (mode === 'multiparty') {
@@ -264,7 +441,7 @@ function buildApp(db, opts = {}) {
     return reply.code(201).send(response);
   });
 
-  // ---- Single-party reveal (legacy, single-shot, transactional) ---------
+  // ---- Single-party reveal (single-shot, transactional) -----------------
   app.post('/draws/:id/reveal', {
     schema: {
       body: {
@@ -303,13 +480,20 @@ function buildApp(db, opts = {}) {
         });
       }
 
-      const candidates = JSON.parse(row.candidates);
-      const order = computeOrder(row.seed, nonce, candidates);
-      const winners = order.slice(0, row.draw_count);
+      const version = row.protocol_version || PROTOCOL_V1;
+      let resultPayload;
+      if (version === PROTOCOL_V3) {
+        const groups = JSON.parse(row.groups);
+        resultPayload = { results: computeGroupedResult(row.seed, nonce, groups) };
+      } else {
+        const candidates = JSON.parse(row.candidates);
+        const order = computeOrder(row.seed, nonce, candidates);
+        resultPayload = { order, winners: order.slice(0, row.draw_count) };
+      }
       const revealedAt = new Date().toISOString();
       const changed = finalizeSingle.run(
         nonce,
-        JSON.stringify({ order, winners }),
+        JSON.stringify(resultPayload),
         revealedAt,
         id
       );
@@ -319,22 +503,7 @@ function buildApp(db, opts = {}) {
       }
       db.exec('COMMIT');
 
-      return reply.send({
-        drawId: row.id,
-        mode: row.mode,
-        status: 'revealed',
-        version: row.protocol_version || PROTOCOL_V1,
-        commitment: row.commitment,
-        snapshotDigest: row.snapshot_digest,
-        seed: row.seed,
-        nonce,
-        candidates,
-        count: row.draw_count,
-        order,
-        winners,
-        createdAt: row.created_at,
-        revealedAt,
-      });
+      return reply.send(publicView(getDraw.get(id), []));
     } catch (err) {
       try { db.exec('ROLLBACK'); } catch { /* no active transaction */ }
       throw err;
@@ -413,8 +582,8 @@ function buildApp(db, opts = {}) {
   // Accepted only after the participant's commitment exists, the draw is in
   // the reveal phase (>=1 commitment), the secret matches the commitment, and
   // this participant has not revealed yet. The last valid reveal aggregates
-  // every secret hash in fixed participant order into the nonce, then reuses
-  // the existing shuffle and finalizes the draw — all in one locked tx.
+  // every secret hash in fixed participant order into the nonce, then runs
+  // the (version-dependent) shuffle and finalizes the draw — all in one tx.
   app.post('/draws/:id/participants/:name/reveal', {
     schema: {
       body: {
@@ -505,12 +674,19 @@ function buildApp(db, opts = {}) {
 
       // Last reveal: aggregate and finalize inside the same lock.
       const nonce = aggregateNonce(freshOrdered.map((p) => p.secret));
-      const candidates = JSON.parse(row.candidates);
-      const order = computeOrder(row.seed, nonce, candidates);
-      const winners = order.slice(0, row.draw_count);
+      const version = row.protocol_version || PROTOCOL_V1;
+      let resultPayload;
+      if (version === PROTOCOL_V3) {
+        const groups = JSON.parse(row.groups);
+        resultPayload = { results: computeGroupedResult(row.seed, nonce, groups) };
+      } else {
+        const candidates = JSON.parse(row.candidates);
+        const order = computeOrder(row.seed, nonce, candidates);
+        resultPayload = { order, winners: order.slice(0, row.draw_count) };
+      }
       const changed = finalizeMultiparty.run(
         nonce,
-        JSON.stringify({ order, winners }),
+        JSON.stringify(resultPayload),
         revealedAt,
         id
       );
@@ -549,17 +725,32 @@ function buildApp(db, opts = {}) {
     }
     const stored = JSON.parse(row.result);
     const participantRows = row.mode === 'multiparty' ? getParticipants.all(row.id) : [];
-    const input = {
-      version: row.protocol_version || PROTOCOL_V1,
-      snapshotDigest: row.snapshot_digest === null ? undefined : row.snapshot_digest,
-      commitment: row.commitment,
-      seed: row.seed,
-      nonce: row.nonce,
-      candidates: JSON.parse(row.candidates),
-      count: row.draw_count,
-      order: stored.order,
-      winners: stored.winners,
-    };
+    const version = row.protocol_version || PROTOCOL_V1;
+
+    let input;
+    if (version === PROTOCOL_V3) {
+      input = {
+        version,
+        snapshotDigest: row.snapshot_digest === null ? undefined : row.snapshot_digest,
+        commitment: row.commitment,
+        seed: row.seed,
+        nonce: row.nonce,
+        groups: JSON.parse(row.groups),
+        results: stored.results,
+      };
+    } else {
+      input = {
+        version,
+        snapshotDigest: row.snapshot_digest === null ? undefined : row.snapshot_digest,
+        commitment: row.commitment,
+        seed: row.seed,
+        nonce: row.nonce,
+        candidates: JSON.parse(row.candidates),
+        count: row.draw_count,
+        order: stored.order,
+        winners: stored.winners,
+      };
+    }
     if (row.mode === 'multiparty') {
       input.contributions = participantRows
         .slice()
@@ -571,33 +762,68 @@ function buildApp(db, opts = {}) {
           secret: p.secret,
         }));
     }
-    const report = verifyRecord(input);
+    let report;
+    try {
+      report = verifyRecord(input);
+    } catch (err) {
+      if (err instanceof VerifyBadRequest) {
+        return badRequest(reply, err.message);
+      }
+      throw err;
+    }
     return { drawId: row.id, mode: row.mode, ...report };
   });
 
   // ---- Independent verification ------------------------------------------
-  // Recompute everything from the commitment, nonce and candidate snapshot;
-  // any supplied field that disagrees with the recomputation is tampered.
-  // `version` selects the commitment formula ('v2' recomputes the snapshot
-  // digest from candidates/count; absent means the legacy v1 algorithm).
+  // Recompute everything from the commitment, nonce and snapshot; any
+  // supplied field that disagrees with the recomputation is tampered.
+  //   v3: `groups` ([{name, candidates, quota}]) + optional `results`;
+  //   v2: `candidates`/`count` (snapshot digest recomputed);
+  //   absent/other version: legacy v1 algorithm.
   // For multi-party draws, `contributions` (in participant order) lets the
   // caller prove the nonce was really derived from the revealed secrets.
   app.post('/verify', {
     schema: {
       body: {
         type: 'object',
-        required: ['commitment', 'seed', 'nonce', 'candidates', 'count'],
+        required: ['commitment', 'seed', 'nonce'],
         additionalProperties: false,
         properties: {
-          version: { type: 'string', enum: [PROTOCOL_V1, PROTOCOL_V2] },
+          version: { type: 'string', enum: [PROTOCOL_V1, PROTOCOL_V2, PROTOCOL_V3] },
           snapshotDigest: { type: 'string', pattern: '^[0-9a-f]{64}$' },
           commitment: { type: 'string', minLength: 1 },
           seed: { type: 'string', minLength: 1 },
           nonce: { type: 'string', minLength: 1, maxLength: MAX_PARTICIPANTS * 64 },
-          candidates: candidateListSchema,
-          count: { type: 'integer', minimum: 1 },
-          order: { ...candidateListSchema, uniqueItems: false, minItems: 0 },
-          winners: { ...candidateListSchema, uniqueItems: false, minItems: 0 },
+          // v1/v2 flat snapshot:
+          candidates: { ...candidateListSchema, minItems: 0 },
+          count: { type: 'integer', minimum: 0 },
+          order: { type: 'array', items: { type: 'string' } },
+          winners: { type: 'array', items: { type: 'string' } },
+          // v3 grouped snapshot (structural/global rules are checked in
+          // verifyRecord so tampered groups are reported, not rejected):
+          groups: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                name: { type: 'string' },
+                candidates: { type: 'array', items: { type: 'string' } },
+                quota: { type: 'integer', minimum: 0 },
+              },
+            },
+          },
+          results: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                name: { type: 'string' },
+                quota: { type: 'integer', minimum: 0 },
+                order: { type: 'array', items: { type: 'string' } },
+                winners: { type: 'array', items: { type: 'string' } },
+              },
+            },
+          },
           contributions: {
             type: 'array',
             minItems: 2,
@@ -617,12 +843,210 @@ function buildApp(db, opts = {}) {
         },
       },
     },
-  }, async (request) => verifyRecord(request.body));
+  }, async (request, reply) => {
+    try {
+      return verifyRecord(request.body);
+    } catch (err) {
+      if (err instanceof VerifyBadRequest) {
+        return badRequest(reply, err.message);
+      }
+      throw err;
+    }
+  });
 
   return app;
 }
 
-function verifyRecord({ commitment, seed, nonce, candidates, count, order, winners, contributions, version, snapshotDigest }) {
+// Common multi-party audit: every revealed secret must open its commitment,
+// positions must be unique and 0-based, and concatenating the secret hashes
+// in fixed order must reproduce the nonce. Returns the derived nonce (which
+// always equals the supplied nonce when nonceDerived holds).
+function checkContributions(contributions, nonce, checks, problems) {
+  const sorted = contributions
+    .slice()
+    .sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
+
+  checks.positionsComplete = sorted.every(
+    (c, i) => Number.isInteger(c.position) && c.position === i
+  );
+  if (!checks.positionsComplete) {
+    problems.push('contributions mismatch: position 必须是从 0 开始的连续序号 — 贡献列表已被篡改');
+  }
+
+  checks.commitmentsOpen = sorted.every((c) => secretHash(c.secret) === c.commitment);
+  if (!checks.commitmentsOpen) {
+    problems.push('contributions mismatch: SHA-256(secret) != commitment — 某条 secret 或 commitment 已被篡改');
+  }
+
+  const derivedNonce = aggregateNonce(sorted.map((c) => c.secret));
+  checks.nonceDerived = derivedNonce === nonce;
+  if (!checks.nonceDerived) {
+    problems.push('nonce mismatch: 按参与者顺序拼接的 secret 哈希与 nonce 不一致 — nonce 或贡献列表已被篡改');
+  }
+  return derivedNonce;
+}
+
+// ---- v3 verification ----------------------------------------------------
+// Recompute the grouped snapshot digest, commitment, contribution chain and
+// per-group results. Tampering is reported per dimension (group names,
+// membership, quotas, winners/orders) so the failure reason is actionable.
+function verifyRecordV3(input) {
+  const {
+    commitment, seed, nonce, groups, snapshotDigest, contributions, results,
+  } = input;
+  const problems = [];
+  const checks = {};
+
+  // 1. Structural validity of the supplied groups themselves.
+  const structuralError = validateGroups(groups);
+  checks.groupsValid = structuralError === null;
+  if (!checks.groupsValid) {
+    problems.push(`groups invalid: ${structuralError} — 分组结构（组名/候选/名额）已被篡改`);
+  }
+
+  // 2. Snapshot digest and the snapshot-bound commitment. Only recompute the
+  //    digest from structurally valid groups (otherwise the snapshot builder
+  //    would throw on the tampered payload).
+  let expectedSnapshotDigest;
+  if (checks.groupsValid) {
+    expectedSnapshotDigest = snapshotDigestForGroups(groups);
+    if (snapshotDigest !== undefined) {
+      checks.snapshotDigestMatch = snapshotDigest === expectedSnapshotDigest;
+      if (!checks.snapshotDigestMatch) {
+        problems.push('snapshot digest mismatch: 分组快照摘要与 groups 重算结果不一致 — 组名、组顺序、归属候选或 quota 已被篡改');
+      }
+    }
+  }
+  checks.commitmentMatch = checks.groupsValid
+    && commitmentForVersion(PROTOCOL_V3, seed, expectedSnapshotDigest) === commitment;
+  if (!checks.commitmentMatch) {
+    problems.push('commitment mismatch: SHA-256(v3:seed:分组快照摘要) != commitment — seed、commitment 或分组快照（组名/归属/名额）已被篡改');
+  }
+
+  // 3. Multi-party contribution chain.
+  let effectiveNonce = nonce;
+  if (Array.isArray(contributions)) {
+    effectiveNonce = checkContributions(contributions, nonce, checks, problems);
+  }
+
+  // 4. Recompute every group's order/winners from (seed, nonce, groups).
+  let expectedResults = [];
+  if (checks.groupsValid) {
+    expectedResults = computeGroupedResult(seed, effectiveNonce, groups);
+  }
+
+  // 5. Cross-check a supplied result set: group set/order, membership, quota
+  //    and the shuffle outcome — naming the offending group on failure.
+  //    Without a structurally valid snapshot these comparisons have no
+  //    trustworthy baseline; the groupsValid problem already fails the report.
+  if (results !== undefined) {
+    const resultChecks = {
+      resultsCountMatch: false,
+      groupNamesMatch: false,
+      membershipMatch: false,
+      quotasMatch: false,
+      ordersMatch: false,
+      winnersMatch: false,
+    };
+
+    if (!checks.groupsValid) {
+      Object.assign(checks, resultChecks);
+    } else {
+      const countOk = Array.isArray(results) && results.length === groups.length;
+      resultChecks.resultsCountMatch = countOk;
+      if (!countOk) {
+        problems.push(`results mismatch: 结果组数 ${Array.isArray(results) ? results.length : '(非数组)'} 与声明组数 ${groups.length} 不一致 — 结果或分组已被篡改`);
+      }
+
+      if (countOk) {
+        let namesOk = true;
+        let membershipOk = true;
+        let quotasOk = true;
+        let ordersOk = true;
+        let winnersOk = true;
+
+        for (let i = 0; i < groups.length; i += 1) {
+          const supplied = results[i];
+          const group = groups[i];
+          const expected = expectedResults[i];
+
+          if (!supplied || typeof supplied !== 'object') {
+            namesOk = membershipOk = quotasOk = ordersOk = winnersOk = false;
+            problems.push(`results[${i}] mismatch: 缺少该组结果 — 结果已被篡改`);
+            continue;
+          }
+
+          // Name / position in the ordered group list.
+          if (supplied.name !== group.name) {
+            namesOk = false;
+            problems.push(`group name mismatch: 第 ${i} 组结果名为 '${supplied.name}'，快照中为 '${group.name}' — 组名或归属已被篡改`);
+          }
+
+          // Quota carried by the result must match the snapshot quota.
+          if (supplied.quota !== group.quota) {
+            quotasOk = false;
+            problems.push(`quota mismatch: 组 '${group.name}' 结果 quota=${supplied.quota}，快照 quota=${group.quota} — 名额已被篡改`);
+          }
+
+          if (Array.isArray(supplied.order)) {
+            // Membership: order must be a permutation of that group's candidates.
+            const sameLength = supplied.order.length === group.candidates.length;
+            const sameMembers = sameLength
+              && new Set(supplied.order).size === supplied.order.length
+              && supplied.order.every((c) => group.candidates.includes(c));
+            if (!sameMembers) {
+              membershipOk = false;
+              problems.push(`membership mismatch: 组 '${group.name}' 的 order 不是该组候选的排列 — 归属候选已被篡改`);
+            }
+            // The shuffled order must equal the deterministic recomputation.
+            const orderOk = sameMembers && supplied.order.every((c, j) => c === expected.order[j]);
+            if (!orderOk) {
+              ordersOk = false;
+              problems.push(`order mismatch: 组 '${group.name}' 的中奖顺序与重算结果不一致 — order/中奖结果已被篡改`);
+            }
+          } else {
+            membershipOk = ordersOk = false;
+            problems.push(`order mismatch: 组 '${group.name}' 缺少 order 数组 — 结果已被篡改`);
+          }
+
+          if (Array.isArray(supplied.winners)) {
+            const winnersOkHere = supplied.winners.length === group.quota
+              && supplied.winners.every((c, j) => c === expected.winners[j]);
+            if (!winnersOkHere) {
+              winnersOk = false;
+              problems.push(`winners mismatch: 组 '${group.name}' 的中奖者（前 ${group.quota} 名）与重算结果不一致 — winners/名额结果已被篡改`);
+            }
+          } else {
+            winnersOk = false;
+            problems.push(`winners mismatch: 组 '${group.name}' 缺少 winners 数组 — 结果已被篡改`);
+          }
+        }
+
+        resultChecks.groupNamesMatch = namesOk;
+        resultChecks.membershipMatch = membershipOk;
+        resultChecks.quotasMatch = quotasOk;
+        resultChecks.ordersMatch = ordersOk;
+        resultChecks.winnersMatch = winnersOk;
+      }
+
+      Object.assign(checks, resultChecks);
+    }
+  }
+
+  return {
+    valid: problems.length === 0,
+    version: PROTOCOL_V3,
+    ...(expectedSnapshotDigest !== undefined ? { snapshotDigest: expectedSnapshotDigest } : {}),
+    checks,
+    expected: { results: expectedResults },
+    problems,
+  };
+}
+
+// ---- v1/v2 verification (legacy flat candidates/count records) ----------
+function verifyRecordLegacy({
+  commitment, seed, nonce, candidates, count, order, winners, contributions, version, snapshotDigest,
+}) {
   const problems = [];
   const checks = {};
   // Records without a version marker verify with the legacy v1 algorithm.
@@ -660,33 +1084,10 @@ function verifyRecord({ commitment, seed, nonce, candidates, count, order, winne
     problems.push('count mismatch: 抽取数量超出候选范围 — count 已被篡改');
   }
 
-  // 3. Multi-party audit trail: every revealed secret must open its
-  //    commitment, positions must be unique and 0-based, and concatenating
-  //    the secret hashes in fixed order must reproduce the nonce.
+  // 3. Multi-party audit trail.
   let effectiveNonce = nonce;
   if (Array.isArray(contributions)) {
-    const sorted = contributions
-      .slice()
-      .sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
-
-    checks.positionsComplete = sorted.every(
-      (c, i) => Number.isInteger(c.position) && c.position === i
-    );
-    if (!checks.positionsComplete) {
-      problems.push('contributions mismatch: position 必须是从 0 开始的连续序号 — 贡献列表已被篡改');
-    }
-
-    checks.commitmentsOpen = sorted.every((c) => secretHash(c.secret) === c.commitment);
-    if (!checks.commitmentsOpen) {
-      problems.push('contributions mismatch: SHA-256(secret) != commitment — 某条 secret 或 commitment 已被篡改');
-    }
-
-    const derivedNonce = aggregateNonce(sorted.map((c) => c.secret));
-    checks.nonceDerived = derivedNonce === nonce;
-    if (!checks.nonceDerived) {
-      problems.push('nonce mismatch: 按参与者顺序拼接的 secret 哈希与 nonce 不一致 — nonce 或贡献列表已被篡改');
-    }
-    effectiveNonce = derivedNonce;
+    effectiveNonce = checkContributions(contributions, nonce, checks, problems);
   }
 
   // 4. Recompute the winning order from (seed, nonce, candidates).
@@ -718,4 +1119,20 @@ function verifyRecord({ commitment, seed, nonce, candidates, count, order, winne
   };
 }
 
-module.exports = { buildApp };
+// Dispatch by protocol version; also enforces that the snapshot fields the
+// selected protocol needs are actually present (400 for a malformed request,
+// versus valid=false with `problems` for a well-formed but tampered record).
+function verifyRecord(input) {
+  if (input.version === PROTOCOL_V3) {
+    if (!Array.isArray(input.groups)) {
+      throw new VerifyBadRequest('v3 verification requires a non-empty groups array');
+    }
+    return verifyRecordV3(input);
+  }
+  if (!Array.isArray(input.candidates) || !Number.isInteger(input.count)) {
+    throw new VerifyBadRequest('v1/v2 verification requires candidates (array) and count (integer)');
+  }
+  return verifyRecordLegacy(input);
+}
+
+module.exports = { buildApp, validateGroups };

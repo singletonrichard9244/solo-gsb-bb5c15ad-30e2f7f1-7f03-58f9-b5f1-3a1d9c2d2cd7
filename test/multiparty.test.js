@@ -6,10 +6,10 @@ const { openDatabase } = require('../src/db');
 const { buildApp } = require('../src/app');
 const {
   sha256Hex,
-  commitmentForVersion,
   secretHash,
   aggregateNonce,
-  computeOrder,
+  computeGroupedResult,
+  snapshotDigestForGroups,
 } = require('../src/lottery');
 
 function makeApp() {
@@ -18,7 +18,11 @@ function makeApp() {
   return { db, app };
 }
 
-const CANDIDATES = ['alice', 'bob', 'carol', 'dave', 'erin'];
+const GROUPS = [
+  { name: 'red', quota: 2, candidates: ['alice', 'bob', 'carol'] },
+  { name: 'blue', quota: 1, candidates: ['dave', 'erin'] },
+];
+const groupsOnly = () => GROUPS.map((g) => ({ name: g.name, quota: g.quota, candidates: [...g.candidates] }));
 const NAMES = ['alice', 'bob', 'carol'];
 const SECRETS = {
   alice: 'alice-secret-entropy-01',
@@ -26,13 +30,13 @@ const SECRETS = {
   carol: 'carol-secret-entropy-03',
 };
 
-async function createMultiparty(app, participants = NAMES) {
+async function createMultiparty(app, participants = NAMES, groups = groupsOnly()) {
   const res = await app.inject({
     method: 'POST',
     url: '/draws',
-    payload: { candidates: CANDIDATES, count: 2, participants },
+    payload: { groups, participants },
   });
-  assert.equal(res.statusCode, 201);
+  assert.equal(res.statusCode, 201, res.body);
   return res.json();
 }
 
@@ -56,31 +60,26 @@ test('create with participants fixes the participant order and starts in commitm
   const { app } = makeApp();
   const created = await createMultiparty(app);
   assert.equal(created.mode, 'multiparty');
+  assert.equal(created.version, 'v3');
   assert.equal(created.status, 'pending');
-  assert.deepEqual(
-    created.participants.map((p) => p.name),
-    NAMES
-  );
-  assert.deepEqual(
-    created.participants.map((p) => p.position),
-    [0, 1, 2]
-  );
+  assert.deepEqual(created.participants.map((p) => p.name), NAMES);
+  assert.deepEqual(created.participants.map((p) => p.position), [0, 1, 2]);
   assert.ok(created.participants.every((p) => p.status === 'pending'));
 
   const shown = (await app.inject({ method: 'GET', url: `/draws/${created.drawId}` })).json();
   assert.equal(shown.mode, 'multiparty');
   assert.equal(shown.committedCount, 0);
   assert.equal(shown.revealedCount, 0);
-  // No commitment values or secrets are exposed before they are submitted.
   assert.ok(shown.participants.every((p) => p.commitment === null));
   assert.equal(shown.nonce, undefined);
+  assert.equal(shown.results, undefined);
 });
 
-test('full multi-party flow aggregates secret hashes in fixed order', async () => {
+test('full multi-party flow aggregates secret hashes in fixed order and draws per group', async () => {
   const { app } = makeApp();
   const created = await createMultiparty(app);
 
-  // Commitments can land in arbitrary order (here reversed).
+  // Commitments can land in arbitrary order.
   const c3 = await commit(app, created.drawId, 'carol');
   assert.equal(c3.statusCode, 201);
   assert.equal(c3.json().status, 'committed', 'first commitment opens the committed phase');
@@ -101,19 +100,25 @@ test('full multi-party flow aggregates secret hashes in fixed order', async () =
 
   const final = r1.json();
   assert.equal(final.status, 'revealed');
-  assert.equal(commitmentForVersion(final.version, final.seed, final.snapshotDigest), created.commitment);
+  assert.equal(final.version, 'v3');
+  assert.equal(
+    sha256Hex(`v3:${final.seed}:${snapshotDigestForGroups(GROUPS)}`),
+    created.commitment
+  );
 
   // nonce = concat of SHA-256(secret) in the declared participant order.
   const expectedNonce = aggregateNonce(NAMES.map((n) => SECRETS[n]));
   assert.equal(final.nonce, expectedNonce);
-  assert.equal(
-    final.nonce,
-    NAMES.map((n) => sha256Hex(SECRETS[n])).join('')
-  );
 
-  // The existing shuffle is reused verbatim.
-  assert.deepEqual(final.order, computeOrder(final.seed, expectedNonce, CANDIDATES));
-  assert.deepEqual(final.winners, final.order.slice(0, 2));
+  // The per-group shuffle is reused for every declared group.
+  const expectedAll = computeGroupedResult(final.seed, expectedNonce, GROUPS);
+  assert.equal(final.results.length, expectedAll.length);
+  final.results.forEach((g, i) => {
+    assert.equal(g.name, expectedAll[i].name);
+    assert.deepEqual(g.order, expectedAll[i].order);
+    assert.deepEqual(g.winners, expectedAll[i].winners);
+  });
+  assert.deepEqual(final.results.map((g) => g.winners.length), [2, 1]);
 
   // Auditable contribution list: positions, commitments, secrets and hashes.
   assert.equal(final.contributions.length, 3);
@@ -129,15 +134,12 @@ test('rejects duplicate commitments and duplicate reveals', async () => {
   const { app } = makeApp();
   const created = await createMultiparty(app);
   await commit(app, created.drawId, 'alice');
-
-  const dupCommit = await commit(app, created.drawId, 'alice');
-  assert.equal(dupCommit.statusCode, 409, 'duplicate commitment rejected');
+  assert.equal((await commit(app, created.drawId, 'alice')).statusCode, 409);
 
   await commit(app, created.drawId, 'bob');
   await commit(app, created.drawId, 'carol');
   await revealSecret(app, created.drawId, 'alice');
-  const dupReveal = await revealSecret(app, created.drawId, 'alice');
-  assert.equal(dupReveal.statusCode, 409, 'duplicate reveal rejected');
+  assert.equal((await revealSecret(app, created.drawId, 'alice')).statusCode, 409);
 });
 
 test('rejects out-of-order operations', async () => {
@@ -153,7 +155,6 @@ test('rejects out-of-order operations', async () => {
   await commit(app, created.drawId, 'bob');
   await commit(app, created.drawId, 'carol');
 
-  // bob never committed to anything... it did; but carol's secret mismatch
   const wrong = await app.inject({
     method: 'POST',
     url: `/draws/${created.drawId}/participants/carol/reveal`,
@@ -161,7 +162,6 @@ test('rejects out-of-order operations', async () => {
   });
   assert.equal(wrong.statusCode, 409, 'secret not matching commitment rejected');
 
-  // Unknown participant names are rejected.
   const strangerCommit = await app.inject({
     method: 'POST',
     url: `/draws/${created.drawId}/participants/mallory/commitment`,
@@ -175,7 +175,6 @@ test('rejects out-of-order operations', async () => {
   });
   assert.equal(strangerReveal.statusCode, 400);
 
-  // Phase is still the reveal phase; normal reveals now finalize.
   const r = await revealSecret(app, created.drawId, 'carol');
   assert.equal(r.statusCode, 200);
   assert.equal(r.json().status, 'committed');
@@ -213,14 +212,14 @@ test('single-nonce and multi-party endpoints cannot be mixed', async () => {
   const single = (await app.inject({
     method: 'POST',
     url: '/draws',
-    payload: { candidates: CANDIDATES, count: 1 },
+    payload: { groups: [{ name: 'solo', quota: 1, candidates: ['a'] }] },
   })).json();
   assert.equal(single.mode, 'single');
   const multiOnSingle = await commit(app, single.drawId, 'alice');
   assert.equal(multiOnSingle.statusCode, 409);
 });
 
-test('stored verify checks the multi-party contribution trail', async () => {
+test('stored verify checks the multi-party contribution chain plus grouped results', async () => {
   const { app } = makeApp();
   const created = await createMultiparty(app);
   for (const n of NAMES) await commit(app, created.drawId, n);
@@ -235,10 +234,11 @@ test('stored verify checks the multi-party contribution trail', async () => {
   assert.equal(report.checks.commitmentsOpen, true);
   assert.equal(report.checks.nonceDerived, true);
   assert.equal(report.checks.positionsComplete, true);
-  assert.equal(report.checks.orderMatch, true);
+  assert.equal(report.checks.ordersMatch, true);
+  assert.equal(report.checks.winnersMatch, true);
 });
 
-test('independent verify flags tampered multi-party contributions', async () => {
+test('independent verify flags tampered multi-party contributions on a v3 draw', async () => {
   const { app } = makeApp();
   const created = await createMultiparty(app);
   for (const n of NAMES) await commit(app, created.drawId, n);
@@ -254,14 +254,12 @@ test('independent verify flags tampered multi-party contributions', async () => 
     commitment: final.commitment,
     seed: final.seed,
     nonce: final.nonce,
-    candidates: CANDIDATES,
-    count: 2,
-    order: final.order,
-    winners: final.winners,
+    groups: groupsOnly(),
+    results: final.results,
     contributions: final.contributions,
   };
 
-  // Tamper one secret but keep the commitment: commitmentsOpen fails.
+  // Tamper one secret but keep the commitment.
   const tamperedSecret = {
     ...base,
     contributions: base.contributions.map((c) =>
@@ -272,8 +270,7 @@ test('independent verify flags tampered multi-party contributions', async () => 
   assert.equal(rep1.valid, false);
   assert.equal(rep1.checks.commitmentsOpen, false);
 
-  // Reorder contributions (swap positions) but keep pairs consistent:
-  // positionsComplete and nonceDerived fail.
+  // Reorder contributions (swap positions) but keep pairs consistent.
   const reordered = {
     ...base,
     contributions: base.contributions.map((c) => {
@@ -286,12 +283,13 @@ test('independent verify flags tampered multi-party contributions', async () => 
   assert.equal(rep2.valid, false);
   assert.equal(rep2.checks.nonceDerived, false);
 
-  // Honest record: everything passes, including order recomputation.
+  // Honest record: everything passes, including grouped result recomputation.
   const ok = (await app.inject({ method: 'POST', url: '/verify', payload: base })).json();
   assert.equal(ok.valid, true);
   assert.equal(ok.checks.commitmentsOpen, true);
   assert.equal(ok.checks.nonceDerived, true);
-  assert.equal(ok.checks.orderMatch, true);
+  assert.equal(ok.checks.ordersMatch, true);
+  assert.equal(ok.checks.winnersMatch, true);
 });
 
 test('participant list validation at creation', async () => {
@@ -300,14 +298,14 @@ test('participant list validation at creation', async () => {
   const dupes = await app.inject({
     method: 'POST',
     url: '/draws',
-    payload: { candidates: CANDIDATES, count: 1, participants: ['a', 'a'] },
+    payload: { groups: groupsOnly(), participants: ['a', 'a'] },
   });
   assert.equal(dupes.statusCode, 400, 'duplicate participants rejected');
 
   const solo = await app.inject({
     method: 'POST',
     url: '/draws',
-    payload: { candidates: CANDIDATES, count: 1, participants: ['alone'] },
+    payload: { groups: groupsOnly(), participants: ['alone'] },
   });
   assert.equal(solo.statusCode, 400, 'a multi-party draw needs at least 2 participants');
 
