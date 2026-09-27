@@ -18,7 +18,8 @@ const DRAWS_TABLE = `
     created_at       TEXT NOT NULL,
     revealed_at      TEXT,
     protocol_version TEXT,
-    snapshot_digest  TEXT
+    snapshot_digest  TEXT,
+    groups           TEXT
   );
 `;
 
@@ -78,6 +79,18 @@ function migrateV1ToV2(db) {
   }
 }
 
+// v3 draws are grouped quota draws: the ordered group definition
+// (group names, per-group candidate membership, per-group quota) is stored
+// verbatim as JSON and bound into the commitment via the v3 snapshot.
+// Pre-v3 rows keep groups = NULL and stay on their original verification
+// path; their flat candidates/draw_count columns are untouched.
+function migrateV2ToV3(db) {
+  const columns = db.prepare('PRAGMA table_info(draws)').all().map((c) => c.name);
+  if (!columns.includes('groups')) {
+    db.exec('ALTER TABLE draws ADD COLUMN groups TEXT');
+  }
+}
+
 // Opens (creating if needed) the SQLite database and ensures the schema exists.
 function openDatabase(dbPath) {
   if (dbPath !== ':memory:') {
@@ -99,6 +112,10 @@ function openDatabase(dbPath) {
   if (version < 2) {
     migrateV1ToV2(db);
     db.exec('PRAGMA user_version = 2;');
+  }
+  if (version < 3) {
+    migrateV2ToV3(db);
+    db.exec('PRAGMA user_version = 3;');
   }
   db.exec(PARTICIPANTS_TABLE);
   db.exec(PARTICIPANTS_INDEX);

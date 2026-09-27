@@ -9,7 +9,7 @@ const {
   commitmentForVersion,
   secretHash,
   aggregateNonce,
-  computeOrder,
+  computeGroupResults,
 } = require('../src/lottery');
 
 function makeApp() {
@@ -18,7 +18,10 @@ function makeApp() {
   return { db, app };
 }
 
-const CANDIDATES = ['alice', 'bob', 'carol', 'dave', 'erin'];
+const GROUPS = [
+  { name: 'main', candidates: ['cand-a', 'cand-b', 'cand-c'], quota: 1 },
+  { name: 'reserve', candidates: ['cand-d', 'cand-e'], quota: 1 },
+];
 const NAMES = ['alice', 'bob', 'carol'];
 const SECRETS = {
   alice: 'alice-secret-entropy-01',
@@ -30,7 +33,7 @@ async function createMultiparty(app, participants = NAMES) {
   const res = await app.inject({
     method: 'POST',
     url: '/draws',
-    payload: { candidates: CANDIDATES, count: 2, participants },
+    payload: { groups: GROUPS, participants },
   });
   assert.equal(res.statusCode, 201);
   return res.json();
@@ -111,9 +114,12 @@ test('full multi-party flow aggregates secret hashes in fixed order', async () =
     NAMES.map((n) => sha256Hex(SECRETS[n])).join('')
   );
 
-  // The existing shuffle is reused verbatim.
-  assert.deepEqual(final.order, computeOrder(final.seed, expectedNonce, CANDIDATES));
-  assert.deepEqual(final.winners, final.order.slice(0, 2));
+  // The grouped draw reuses the same shuffle, one stream per group.
+  const expected = computeGroupResults(final.seed, expectedNonce, GROUPS);
+  assert.deepEqual(
+    final.groups.map((g) => ({ name: g.name, order: g.order, winners: g.winners })),
+    expected.map((g) => ({ name: g.name, order: g.order, winners: g.winners }))
+  );
 
   // Auditable contribution list: positions, commitments, secrets and hashes.
   assert.equal(final.contributions.length, 3);
@@ -153,7 +159,7 @@ test('rejects out-of-order operations', async () => {
   await commit(app, created.drawId, 'bob');
   await commit(app, created.drawId, 'carol');
 
-  // bob never committed to anything... it did; but carol's secret mismatch
+  // carol's secret does not match her commitment.
   const wrong = await app.inject({
     method: 'POST',
     url: `/draws/${created.drawId}/participants/carol/reveal`,
@@ -213,7 +219,7 @@ test('single-nonce and multi-party endpoints cannot be mixed', async () => {
   const single = (await app.inject({
     method: 'POST',
     url: '/draws',
-    payload: { candidates: CANDIDATES, count: 1 },
+    payload: { groups: [{ name: 'solo', candidates: ['x', 'y'], quota: 1 }] },
   })).json();
   assert.equal(single.mode, 'single');
   const multiOnSingle = await commit(app, single.drawId, 'alice');
@@ -254,10 +260,7 @@ test('independent verify flags tampered multi-party contributions', async () => 
     commitment: final.commitment,
     seed: final.seed,
     nonce: final.nonce,
-    candidates: CANDIDATES,
-    count: 2,
-    order: final.order,
-    winners: final.winners,
+    groups: final.groups,
     contributions: final.contributions,
   };
 
@@ -286,7 +289,7 @@ test('independent verify flags tampered multi-party contributions', async () => 
   assert.equal(rep2.valid, false);
   assert.equal(rep2.checks.nonceDerived, false);
 
-  // Honest record: everything passes, including order recomputation.
+  // Honest record: everything passes, including per-group order recomputation.
   const ok = (await app.inject({ method: 'POST', url: '/verify', payload: base })).json();
   assert.equal(ok.valid, true);
   assert.equal(ok.checks.commitmentsOpen, true);
@@ -300,14 +303,14 @@ test('participant list validation at creation', async () => {
   const dupes = await app.inject({
     method: 'POST',
     url: '/draws',
-    payload: { candidates: CANDIDATES, count: 1, participants: ['a', 'a'] },
+    payload: { groups: GROUPS, participants: ['a', 'a'] },
   });
   assert.equal(dupes.statusCode, 400, 'duplicate participants rejected');
 
   const solo = await app.inject({
     method: 'POST',
     url: '/draws',
-    payload: { candidates: CANDIDATES, count: 1, participants: ['alone'] },
+    payload: { groups: GROUPS, participants: ['alone'] },
   });
   assert.equal(solo.statusCode, 400, 'a multi-party draw needs at least 2 participants');
 

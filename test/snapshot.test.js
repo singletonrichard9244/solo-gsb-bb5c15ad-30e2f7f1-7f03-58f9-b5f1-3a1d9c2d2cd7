@@ -13,7 +13,6 @@ const {
   commitmentFor,
   commitmentForVersion,
   snapshotDigestFor,
-  secretHash,
   computeOrder,
 } = require('../src/lottery');
 
@@ -37,69 +36,33 @@ test('snapshot digest: count decimal, newline, then length-prefixed utf8 bytes i
   assert.notEqual(snapshotDigestFor(['ab', 'é', '🎰'], 2), digest);
 });
 
-test('v2 create publishes a snapshot-bound commitment and persists version + digest', async () => {
-  const { db, app } = makeApp();
-  const res = await app.inject({
-    method: 'POST',
-    url: '/draws',
-    payload: { candidates: CANDIDATES, count: 2 },
-  });
-  assert.equal(res.statusCode, 201);
-  const body = res.json();
-  assert.equal(body.version, 'v2');
-  const expectedDigest = snapshotDigestFor(CANDIDATES, 2);
-  assert.equal(body.snapshotDigest, expectedDigest);
-  assert.match(body.commitment, /^[0-9a-f]{64}$/);
-  assert.equal(body.seed, undefined, 'seed must stay hidden');
-
-  const row = db.prepare(
-    'SELECT protocol_version, snapshot_digest FROM draws WHERE id = ?'
-  ).get(body.drawId);
-  assert.equal(row.protocol_version, 'v2');
-  assert.equal(row.snapshot_digest, expectedDigest);
-
-  const shown = (await app.inject({ method: 'GET', url: `/draws/${body.drawId}` })).json();
-  assert.equal(shown.version, 'v2');
-  assert.equal(shown.snapshotDigest, expectedDigest);
-});
-
-test('v2 reveal outputs version + digest; verify recomputes per version and flags snapshot tampering', async () => {
+test('v2 records verify independently and snapshot tampering is flagged', async () => {
   const { app } = makeApp();
-  const created = (await app.inject({
-    method: 'POST',
-    url: '/draws',
-    payload: { candidates: CANDIDATES, count: 2 },
-  })).json();
-  const revealed = (await app.inject({
-    method: 'POST',
-    url: `/draws/${created.drawId}/reveal`,
-    payload: { nonce: 'nonce-1' },
-  })).json();
-
-  assert.equal(revealed.version, 'v2');
-  assert.equal(revealed.snapshotDigest, created.snapshotDigest);
-  // commitment = SHA-256("v2:<seed>:<snapshotDigest>")
-  assert.equal(revealed.commitment, sha256Hex(`v2:${revealed.seed}:${created.snapshotDigest}`));
-  assert.notEqual(revealed.commitment, commitmentFor(revealed.seed), 'v2 is not the legacy formula');
-
+  const seed = 'e'.repeat(64);
+  const nonce = 'v2-record';
+  const snapshotDigest = snapshotDigestFor(CANDIDATES, 2);
+  const commitment = sha256Hex(`v2:${seed}:${snapshotDigest}`);
+  const order = computeOrder(seed, nonce, CANDIDATES);
   const record = {
-    version: revealed.version,
-    snapshotDigest: revealed.snapshotDigest,
-    commitment: revealed.commitment,
-    seed: revealed.seed,
-    nonce: revealed.nonce,
-    candidates: revealed.candidates,
-    count: revealed.count,
-    order: revealed.order,
-    winners: revealed.winners,
+    version: 'v2',
+    snapshotDigest,
+    commitment,
+    seed,
+    nonce,
+    candidates: CANDIDATES,
+    count: 2,
+    order,
+    winners: order.slice(0, 2),
   };
+
   const ok = (await app.inject({ method: 'POST', url: '/verify', payload: record })).json();
   assert.equal(ok.valid, true);
   assert.equal(ok.version, 'v2');
-  assert.equal(ok.snapshotDigest, created.snapshotDigest);
+  assert.equal(ok.snapshotDigest, snapshotDigest);
   assert.equal(ok.checks.commitmentMatch, true);
   assert.equal(ok.checks.snapshotDigestMatch, true);
   assert.equal(ok.checks.orderMatch, true);
+  assert.notEqual(commitment, commitmentFor(seed), 'v2 is not the legacy formula');
 
   // Candidate order changed -> digest changes -> commitment check fails.
   const reordered = { ...record, candidates: [...CANDIDATES].reverse() };
@@ -137,72 +100,38 @@ test('v2 reveal outputs version + digest; verify recomputes per version and flag
   })).json();
   assert.equal(rep4.valid, false);
   assert.equal(rep4.checks.snapshotDigestMatch, false);
-
-  // Stored verify recomputes the v2 commitment and digest from the snapshot.
-  const stored = (await app.inject({ method: 'GET', url: `/draws/${created.drawId}/verify` })).json();
-  assert.equal(stored.valid, true);
-  assert.equal(stored.version, 'v2');
-  assert.equal(stored.snapshotDigest, created.snapshotDigest);
-  assert.equal(stored.checks.snapshotDigestMatch, true);
 });
 
-test('multiparty draws are created with v2 snapshot commitments too', async () => {
-  const { app } = makeApp();
-  const names = ['alice', 'bob'];
-  const secrets = { alice: 'alice-secret-entropy-01', bob: 'bob-secret-entropy-02' };
+test('stored v2 rows stay queryable and verify with the v2 algorithm', async () => {
+  const { db, app } = makeApp();
+  const seed = 'f'.repeat(64);
+  const nonce = 'stored-v2';
+  const snapshotDigest = snapshotDigestFor(CANDIDATES, 2);
+  const order = computeOrder(seed, nonce, CANDIDATES);
+  const id = 'stored-v2-draw';
+  db.prepare(
+    `INSERT INTO draws (id, mode, status, commitment, seed, nonce, candidates, draw_count,
+                        result, created_at, revealed_at, protocol_version, snapshot_digest)
+     VALUES (?, 'single', 'revealed', ?, ?, ?, ?, ?, ?, ?, ?, 'v2', ?)`
+  ).run(
+    id, sha256Hex(`v2:${seed}:${snapshotDigest}`), seed, nonce, JSON.stringify(CANDIDATES), 2,
+    JSON.stringify({ order, winners: order.slice(0, 2) }),
+    new Date().toISOString(), new Date().toISOString(), snapshotDigest
+  );
 
-  const created = (await app.inject({
-    method: 'POST',
-    url: '/draws',
-    payload: { candidates: CANDIDATES, count: 2, participants: names },
-  })).json();
-  assert.equal(created.mode, 'multiparty');
-  assert.equal(created.version, 'v2');
-  assert.equal(created.snapshotDigest, snapshotDigestFor(CANDIDATES, 2));
+  const shown = (await app.inject({ method: 'GET', url: `/draws/${id}` })).json();
+  assert.equal(shown.version, 'v2');
+  assert.equal(shown.snapshotDigest, snapshotDigest);
+  assert.deepEqual(shown.candidates, CANDIDATES);
+  assert.deepEqual(shown.order, order);
 
-  for (const n of names) {
-    await app.inject({
-      method: 'POST',
-      url: `/draws/${created.drawId}/participants/${n}/commitment`,
-      payload: { commitment: secretHash(secrets[n]) },
-    });
-  }
-  let final;
-  for (const n of names) {
-    final = (await app.inject({
-      method: 'POST',
-      url: `/draws/${created.drawId}/participants/${n}/reveal`,
-      payload: { secret: secrets[n] },
-    })).json();
-  }
-  assert.equal(final.status, 'revealed');
-  assert.equal(final.version, 'v2');
-  assert.equal(final.snapshotDigest, created.snapshotDigest);
-  assert.equal(final.commitment, sha256Hex(`v2:${final.seed}:${created.snapshotDigest}`));
-
-  const stored = (await app.inject({ method: 'GET', url: `/draws/${created.drawId}/verify` })).json();
-  assert.equal(stored.valid, true);
-  assert.equal(stored.version, 'v2');
-
-  const ok = (await app.inject({
-    method: 'POST',
-    url: '/verify',
-    payload: {
-      version: 'v2',
-      snapshotDigest: final.snapshotDigest,
-      commitment: final.commitment,
-      seed: final.seed,
-      nonce: final.nonce,
-      candidates: CANDIDATES,
-      count: 2,
-      order: final.order,
-      winners: final.winners,
-      contributions: final.contributions,
-    },
-  })).json();
-  assert.equal(ok.valid, true);
-  assert.equal(ok.checks.snapshotDigestMatch, true);
-  assert.equal(ok.checks.nonceDerived, true);
+  const report = (await app.inject({ method: 'GET', url: `/draws/${id}/verify` })).json();
+  assert.equal(report.valid, true);
+  assert.equal(report.version, 'v2');
+  assert.equal(report.snapshotDigest, snapshotDigest);
+  assert.equal(report.checks.commitmentMatch, true);
+  assert.equal(report.checks.snapshotDigestMatch, true);
+  assert.equal(report.checks.orderMatch, true);
 });
 
 test('records without a version verify with the legacy v1 algorithm', async () => {
@@ -305,21 +234,21 @@ test('startup migrates a v1 database file and keeps its rows verifiable', async 
     const columns = db.prepare('PRAGMA table_info(draws)').all().map((c) => c.name);
     assert.ok(columns.includes('protocol_version'), 'migration adds protocol_version');
     assert.ok(columns.includes('snapshot_digest'), 'migration adds snapshot_digest');
-    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 2);
+    assert.ok(columns.includes('groups'), 'migration adds groups');
+    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 3);
 
     // The pre-existing row verifies with the legacy algorithm.
     const report = (await app.inject({ method: 'GET', url: '/draws/pre-v2-draw/verify' })).json();
     assert.equal(report.valid, true);
     assert.equal(report.version, 'v1');
 
-    // New draws on the migrated database use the v2 snapshot commitment.
+    // New draws on the migrated database are v3 grouped draws.
     const created = (await app.inject({
       method: 'POST',
       url: '/draws',
-      payload: { candidates: CANDIDATES, count: 2 },
+      payload: { groups: [{ name: 'g', candidates: CANDIDATES, quota: 2 }] },
     })).json();
-    assert.equal(created.version, 'v2');
-    assert.equal(created.snapshotDigest, snapshotDigestFor(CANDIDATES, 2));
+    assert.equal(created.version, 'v3');
   } finally {
     await app.close();
     db.close();
@@ -327,10 +256,98 @@ test('startup migrates a v1 database file and keeps its rows verifiable', async 
   }
 });
 
-test('commitmentForVersion falls back to v1 for anything that is not v2', () => {
+test('startup migrates a v2 database file; pending v2 draws stay revealable', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'draws-migration-v2-'));
+  const dbPath = path.join(dir, 'draws.db');
+
+  // Build a v2 database exactly as the v2 release would have: snapshot columns
+  // present, no groups column, user_version = 2, one revealed and one pending
+  // v2 draw.
+  const revealedSeed = 'd'.repeat(64);
+  const revealedNonce = 'v2-revealed';
+  const revealedDigest = snapshotDigestFor(CANDIDATES, 2);
+  const revealedOrder = computeOrder(revealedSeed, revealedNonce, CANDIDATES);
+  const pendingSeed = '1'.repeat(64);
+  const pendingDigest = snapshotDigestFor(CANDIDATES, 2);
+  {
+    const db = new DatabaseSync(dbPath);
+    db.exec(`CREATE TABLE draws (
+      id               TEXT PRIMARY KEY,
+      mode             TEXT NOT NULL DEFAULT 'single' CHECK (mode IN ('single', 'multiparty')),
+      status           TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'committed', 'revealed')),
+      commitment       TEXT NOT NULL,
+      seed             TEXT NOT NULL,
+      nonce            TEXT,
+      candidates       TEXT NOT NULL,
+      draw_count       INTEGER NOT NULL,
+      result           TEXT,
+      created_at       TEXT NOT NULL,
+      revealed_at      TEXT,
+      protocol_version TEXT,
+      snapshot_digest  TEXT
+    )`);
+    db.exec('PRAGMA user_version = 2');
+    db.prepare(
+      `INSERT INTO draws (id, mode, status, commitment, seed, nonce, candidates, draw_count,
+                          result, created_at, revealed_at, protocol_version, snapshot_digest)
+       VALUES ('v2-revealed-draw', 'single', 'revealed', ?, ?, ?, ?, ?, ?, ?, ?, 'v2', ?)`
+    ).run(
+      sha256Hex(`v2:${revealedSeed}:${revealedDigest}`), revealedSeed, revealedNonce,
+      JSON.stringify(CANDIDATES), 2,
+      JSON.stringify({ order: revealedOrder, winners: revealedOrder.slice(0, 2) }),
+      new Date().toISOString(), new Date().toISOString(), revealedDigest
+    );
+    db.prepare(
+      `INSERT INTO draws (id, mode, status, commitment, seed, candidates, draw_count,
+                          created_at, protocol_version, snapshot_digest)
+       VALUES ('v2-pending-draw', 'single', 'pending', ?, ?, ?, ?, ?, 'v2', ?)`
+    ).run(
+      sha256Hex(`v2:${pendingSeed}:${pendingDigest}`), pendingSeed,
+      JSON.stringify(CANDIDATES), 2, new Date().toISOString(), pendingDigest
+    );
+    db.close();
+  }
+
+  const db = openDatabase(dbPath);
+  const app = buildApp(db, { logger: false });
+  try {
+    const columns = db.prepare('PRAGMA table_info(draws)').all().map((c) => c.name);
+    assert.ok(columns.includes('groups'), 'v2 -> v3 migration adds the groups column');
+    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 3);
+
+    // The revealed v2 row still verifies with the v2 algorithm.
+    const report = (await app.inject({ method: 'GET', url: '/draws/v2-revealed-draw/verify' })).json();
+    assert.equal(report.valid, true);
+    assert.equal(report.version, 'v2');
+    assert.equal(report.checks.snapshotDigestMatch, true);
+
+    // The pending v2 draw can still be revealed on its original code path.
+    const reveal = await app.inject({
+      method: 'POST',
+      url: '/draws/v2-pending-draw/reveal',
+      payload: { nonce: 'post-migration-nonce' },
+    });
+    assert.equal(reveal.statusCode, 200);
+    const r = reveal.json();
+    assert.equal(r.version, 'v2');
+    assert.deepEqual(r.order, computeOrder(pendingSeed, 'post-migration-nonce', CANDIDATES));
+    assert.deepEqual(r.winners, r.order.slice(0, 2));
+
+    const verified = (await app.inject({ method: 'GET', url: '/draws/v2-pending-draw/verify' })).json();
+    assert.equal(verified.valid, true);
+    assert.equal(verified.version, 'v2');
+  } finally {
+    await app.close();
+    db.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('commitmentForVersion falls back to v1 for anything that is not v2/v3', () => {
   const seed = 'd'.repeat(64);
   assert.equal(commitmentForVersion('v1', seed, 'ignored'), commitmentFor(seed));
   assert.equal(commitmentForVersion(undefined, seed, undefined), commitmentFor(seed));
   const digest = snapshotDigestFor(CANDIDATES, 2);
   assert.equal(commitmentForVersion('v2', seed, digest), sha256Hex(`v2:${seed}:${digest}`));
+  assert.equal(commitmentForVersion('v3', seed, digest), sha256Hex(`v3:${seed}:${digest}`));
 });

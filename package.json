@@ -1,7 +1,7 @@
 {
   "name": "verifiable-draw",
   "version": "1.0.0",
-  "description": "Verifiable commit-reveal public draw API (Fastify + SQLite)",
+  "description": "Verifiable commit-reveal grouped quota draw API (Fastify + SQLite)",
   "private": true,
   "main": "src/index.js",
   "scripts": {
